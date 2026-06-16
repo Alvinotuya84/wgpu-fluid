@@ -1,56 +1,107 @@
-# Welcome to your Expo app 👋
+# wgpu-fluid
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+A real-time, touch-interactive fluid simulation that runs entirely on the
+mobile GPU — no game engine, no Three.js, just [WebGPU](https://www.w3.org/TR/webgpu/)
+compute shaders driven from React Native.
 
-## Get started
+Built with [Expo](https://expo.dev), [TypeGPU](https://typegpu.com), and
+[`react-native-webgpu`](https://github.com/wcandillon/react-native-webgpu).
 
-1. Install dependencies
+## What it does
 
-   ```bash
-   npm install
-   ```
+Touch the screen and drag — each frame, a stack of compute shaders solves an
+incompressible Navier–Stokes fluid on a 128×128 grid (16,384 cells) and
+renders the resulting dye field as a fullscreen quad. Every cell on the grid
+updates in parallel, on-device, with no server or cloud API involved.
 
-2. Start the app
+Per frame, the simulation runs 5 compute shaders sequentially (each one reads
+the previous pass's output, via ping-pong buffers), for 24 GPU dispatches total:
 
-   ```bash
-   npx expo start
-   ```
+1. **Splat** — injects velocity and dye at the touch point
+2. **Advect** — moves velocity and dye along the velocity field
+   (semi-Lagrangian advection)
+3. **Divergence** — measures how much fluid is "piling up" at each cell
+4. **Pressure solve** — 20 Jacobi iterations to find the pressure field
+5. **Gradient subtract** — subtracts the pressure gradient from velocity to
+   enforce incompressibility
 
-In the output, you'll find options to open the app in a
+...followed by a render pass that draws the dye field as a fullscreen quad.
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+The project also includes a second, work-in-progress demo: a brute-force
+O(n²) N-body gravity simulation (`src/components/nbody-canvas/`) built on the
+same compute-shader plumbing, with particles attracted to each other and to
+the touch point. It's not currently wired into a screen.
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+## Tech stack
 
-## Get a fresh project
+- [Expo](https://expo.dev) + [Expo Router](https://docs.expo.dev/router/introduction/) (file-based routing)
+- [`react-native-webgpu`](https://github.com/wcandillon/react-native-webgpu) — native WebGPU bridge for React Native, by William Candillon
+- [TypeGPU](https://typegpu.com) — typed WGSL/shader authoring layer, by Software Mansion
+- TypeScript throughout, including inside the shaders themselves (TypeGPU's `"use gpu"` functions)
 
-When you're ready, run:
+## Project structure
 
-```bash
-npm run reset-project
+```
+src/
+  app/
+    index.tsx              # Home tab
+    explore.tsx             # Explore tab — the fluid sim, full-bleed
+    _layout.tsx              # Tab navigator
+  components/
+    fluid-canvas/
+      index.tsx              # React component, WebGPU setup, render loop, touch handling
+      Schemas.ts              # FluidCell/FluidGrid structs + shared bind group layout
+      params.ts                # Tunable constants (grid size, viscosity, dt, ...)
+      Splat.ts                  # touch injection compute shader
+      Advect.ts                  # advection compute shader
+      Project.ts                  # divergence / pressure / gradient-subtract shaders
+      Render.ts                    # fullscreen-quad vertex + fragment shaders
+    nbody-canvas/
+      index.tsx, Schemas.ts, Gravity.ts, Render.ts, params.ts
+      # same shape as fluid-canvas, but a particle-based N-body gravity sim
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+## Getting started
 
-### Other setup steps
+This app uses a native module (`react-native-webgpu`), so it needs a custom
+development build — it will **not** run inside Expo Go.
 
-- To set up ESLint for linting, run `npx expo lint`, or follow our guide on ["Using ESLint and Prettier"](https://docs.expo.dev/guides/using-eslint/)
-- If you'd like to set up unit testing, follow our guide on ["Unit Testing with Jest"](https://docs.expo.dev/develop/unit-testing/)
-- Learn more about the TypeScript setup in this template in our guide on ["Using TypeScript"](https://docs.expo.dev/guides/typescript/)
+```bash
+npm install
 
-## Learn more
+# build and run the native dev client once
+npx expo run:ios       # or
+npx expo run:android
 
-To learn more about developing your project with Expo, look at the following resources:
+# then, for subsequent runs, just start the dev server
+npm run start
+```
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+Other scripts:
 
-## Join the community
+```bash
+npm run web      # web (requires browser WebGPU support, e.g. recent Chrome)
+npm run lint      # expo lint
+```
 
-Join our community of developers creating universal apps.
+## Tuning the simulation
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+All the fluid-sim constants live in [`src/components/fluid-canvas/params.ts`](src/components/fluid-canvas/params.ts):
+
+| Constant            | Default | Effect                                      |
+| -------------------- | ------- | -------------------------------------------- |
+| `GRID_SIZE`           | 128     | Simulation resolution (cells per side)        |
+| `JACOBI_ITERATIONS`    | 20      | Pressure solve accuracy vs. cost              |
+| `VISCOSITY`             | 0.0001  | Fluid thickness                                |
+| `DIFFUSION`              | 0.0001  | How fast dye diffuses                          |
+| `DT`                      | 0.016   | Simulation time step per frame                  |
+| `WORKGROUP_SIZE`           | 8       | Compute shader workgroup size (8×8 = 64 threads) |
+
+## Credits
+
+- [TypeGPU](https://github.com/software-mansion/TypeGPU) by [Software Mansion](https://swmansion.com)
+- [`react-native-webgpu`](https://github.com/wcandillon/react-native-webgpu) by [William Candillon](https://github.com/wcandillon)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
