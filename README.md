@@ -2,7 +2,7 @@
 
 A real-time, touch-interactive fluid simulation that runs entirely on the
 mobile GPU — no game engine, no Three.js, just [WebGPU](https://www.w3.org/TR/webgpu/)
-compute shaders driven from React Native.
+compute shaders driven from React Native:
 
 Built with [Expo](https://expo.dev), [TypeGPU](https://typegpu.com), and
 [`react-native-webgpu`](https://github.com/wcandillon/react-native-webgpu).
