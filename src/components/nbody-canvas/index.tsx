@@ -8,22 +8,14 @@ import {
 } from 'react-native';
 import { Canvas, useCanvasRef, useDevice } from 'react-native-webgpu';
 import tgpu from 'typegpu';
+import * as d from 'typegpu/data';
 
-import { advectShader } from './Advect';
-import {
-    DIFFUSION,
-    DT,
-    GRID_SIZE,
-    JACOBI_ITERATIONS,
-    VISCOSITY,
-    WORKGROUP_SIZE,
-} from './params';
-import { divergenceShader, gradientSubtractShader, pressureShader } from './Project';
-import { fluidFragmentShader, fluidVertexShader } from './Render';
-import { FluidGrid, FluidUniforms, fluidBindGroupLayout } from './Schemas';
-import { splatShader } from './Splat';
+import { gravityShader } from './Gravity';
+import { DT, PARTICLE_COUNT, WORKGROUP_SIZE } from './params';
+import { particleFragmentShader, particleVertexShader } from './Render';
+import { ParticleBuffer, NBodyUniforms, nbodyBindGroupLayout } from './Schemas';
 
-// ─── useWebGPU hook (from the example project) ─────────────────────────────
+// ─── useWebGPU hook (same as fluid-canvas) ──────────────────────────────────
 
 interface SceneProps {
   context: GPUCanvasContext;
@@ -87,9 +79,9 @@ function useWebGPU(scene: Scene) {
   return canvasRef;
 }
 
-// ─── FluidCanvas component ──────────────────────────────────────────────────
+// ─── NBodyCanvas component ───────────────────────────────────────────────────
 
-export function FluidCanvas() {
+export function NBodyCanvas() {
   // touch state — updated from RN gestures, read by the GPU each frame
   const touchRef = useRef({ x: 0.5, y: 0.5, active: false });
 
@@ -97,112 +89,85 @@ export function FluidCanvas() {
     // ── 1. Init TypeGPU root from the device we already have ───────────────
     const root = tgpu.initFromDevice({ device });
 
-    // ── 2. Create ping-pong grid buffers ────────────────────────────────────
-    // (storage buffers are zero-initialized by WebGPU — no manual fill needed)
-    const bufferA = root.createBuffer(FluidGrid).$usage('storage');
-    const bufferB = root.createBuffer(FluidGrid).$usage('storage');
+    // ── 2. Seed initial particle state ──────────────────────────────────────
+    // Random positions scattered across the sim space, small random
+    // velocities so the cluster isn't perfectly still on frame one.
+    const initialParticles = Array.from({ length: PARTICLE_COUNT }, () => ({
+      position: d.vec2f(Math.random(), Math.random()),
+      velocity: d.vec2f((Math.random() - 0.5) * 0.05, (Math.random() - 0.5) * 0.05),
+      mass: 0.5 + Math.random() * 1.5,
+    }));
 
-    // ── 3. Uniforms buffer ────────────────────────────────────────────────
+    // ── 3. Create ping-pong particle buffers ────────────────────────────────
+    const bufferA = root.createBuffer(ParticleBuffer, initialParticles).$usage('storage');
+    const bufferB = root.createBuffer(ParticleBuffer).$usage('storage');
+
+    // ── 4. Uniforms buffer ────────────────────────────────────────────────
     const uniformsBuffer = root
-      .createBuffer(FluidUniforms, {
-        gridSize: GRID_SIZE,
+      .createBuffer(NBodyUniforms, {
         dt: DT,
-        viscosity: VISCOSITY,
-        diffusion: DIFFUSION,
-        time: 0,
         touchX: 0.5,
         touchY: 0.5,
         touchActive: 0,
       })
       .$usage('uniform');
 
-    // ── 4. Build bind groups (A→B and B→A for ping-pong) ─────────────────
-    const bindGroupAB = root.createBindGroup(fluidBindGroupLayout, {
-      current: bufferA,
-      next: bufferB,
-      uniforms: uniformsBuffer,
-    });
+    // ── 5. Build bind groups (A→B and B→A for ping-pong) ─────────────────
+    const bindGroups = [
+      root.createBindGroup(nbodyBindGroupLayout, {
+        current: bufferA,
+        next: bufferB,
+        uniforms: uniformsBuffer,
+      }),
+      root.createBindGroup(nbodyBindGroupLayout, {
+        current: bufferB,
+        next: bufferA,
+        uniforms: uniformsBuffer,
+      }),
+    ];
 
-    const bindGroupBA = root.createBindGroup(fluidBindGroupLayout, {
-      current: bufferB,
-      next: bufferA,
-      uniforms: uniformsBuffer,
-    });
-
-    // ── 5. Build compute pipelines ────────────────────────────────────────
-    const advectPipeline     = root.createComputePipeline({ compute: advectShader });
-    const divergencePipeline = root.createComputePipeline({ compute: divergenceShader });
-    const pressurePipeline   = root.createComputePipeline({ compute: pressureShader });
-    const gradientPipeline   = root.createComputePipeline({ compute: gradientSubtractShader });
-    const splatPipeline      = root.createComputePipeline({ compute: splatShader });
-
-    // ── 6. Build render pipeline ──────────────────────────────────────────
+    // ── 6. Build pipelines ───────────────────────────────────────────────
+    const gravityPipeline = root.createComputePipeline({ compute: gravityShader });
     const renderPipeline = root.createRenderPipeline({
-      vertex: fluidVertexShader,
-      fragment: fluidFragmentShader,
+      vertex: particleVertexShader,
+      fragment: particleFragmentShader,
       primitive: { topology: 'triangle-list' },
     });
 
-    // ── 7. Workgroup dispatch count ───────────────────────────────────────
-    const dispatchCount = Math.ceil(GRID_SIZE / WORKGROUP_SIZE);
+    const dispatchCount = Math.ceil(PARTICLE_COUNT / WORKGROUP_SIZE);
 
-    // ── 8. Frame state ────────────────────────────────────────────────────
-    let pingPong = 0; // 0 = A→B, 1 = B→A
-    let frameTime = 0;
+    // ── 7. Frame state ────────────────────────────────────────────────────
+    let swap = 0; // 0 = current is bufferA, 1 = current is bufferB
 
-    // helper: dispatch a compute pipeline against whichever bind group
-    // matches the current ping-pong state, then flip it
-    const runCompute = (pipeline: typeof advectPipeline) => {
-      const bindGroup = pingPong === 0 ? bindGroupAB : bindGroupBA;
-      pipeline.with(bindGroup).dispatchWorkgroups(dispatchCount, dispatchCount);
-      pingPong = 1 - pingPong;
-    };
-
-    // ── 9. Render loop ────────────────────────────────────────────────────
+    // ── 8. Render loop ────────────────────────────────────────────────────
     return (timestamp: number) => {
-      frameTime += DT;
-
       const touch = touchRef.current;
 
-      // update uniforms each frame
       uniformsBuffer.write({
-        gridSize: GRID_SIZE,
         dt: DT,
-        viscosity: VISCOSITY,
-        diffusion: DIFFUSION,
-        time: frameTime,
         touchX: touch.x,
         touchY: touch.y,
         touchActive: touch.active ? 1 : 0,
       });
 
-      // splat touch input
-      runCompute(splatPipeline);
+      // gravity step: read from bindGroups[swap].current, write into .next
+      gravityPipeline.with(bindGroups[swap]).dispatchWorkgroups(dispatchCount);
 
-      // advect velocity + dye
-      runCompute(advectPipeline);
-
-      // compute divergence
-      runCompute(divergencePipeline);
-
-      // jacobi pressure solve — multiple iterations
-      for (let i = 0; i < JACOBI_ITERATIONS; i++) runCompute(pressurePipeline);
-
-      // subtract gradient
-      runCompute(gradientPipeline);
-
-      // render — read from whichever buffer ping-pong left as "current"
-      const renderBindGroup = pingPong === 0 ? bindGroupAB : bindGroupBA;
+      // render the buffer we just wrote into — that's "current" on the
+      // *other* bind group
+      const renderBindGroup = bindGroups[1 - swap];
 
       renderPipeline
         .withColorAttachment({
           view: context,
-          clearValue: { r: 0, g: 0, b: 0, a: 1 },
+          clearValue: { r: 0, g: 0, b: 0.03, a: 1 },
           loadOp: 'clear',
           storeOp: 'store',
         })
         .with(renderBindGroup)
-        .draw(6); // 6 vertices = fullscreen quad
+        .draw(6, PARTICLE_COUNT);
+
+      swap = 1 - swap;
     };
   }, []);
 
