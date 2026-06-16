@@ -4,6 +4,11 @@
   "version": "1.0.0",
   "dependencies": {
     "@expo/ui": "~56.0.18",
+    "@loaders.gl/core": "^4.4.3",
+    "@loaders.gl/gltf": "^4.4.3",
+    "@typegpu/noise": "^0.11.0",
+    "@typegpu/react": "^0.11.1",
+    "@typegpu/sdf": "^0.11.1",
     "expo": "~56.0.12",
     "expo-constants": "~56.0.18",
     "expo-device": "~56.0.4",
@@ -25,17 +30,22 @@
     "react-native-safe-area-context": "~5.7.0",
     "react-native-screens": "4.25.2",
     "react-native-web": "~0.21.0",
-    "react-native-worklets": "0.8.3"
+    "react-native-wgpu": "^0.5.15",
+    "react-native-worklets": "0.8.3",
+    "typegpu": "^0.11.8",
+    "wgpu-matrix": "^3.4.2"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
-    "typescript": "~6.0.3"
+    "@webgpu/types": "^0.1.70",
+    "typescript": "~6.0.3",
+    "unplugin-typegpu": "^0.11.5"
   },
   "scripts": {
     "start": "expo start",
     "reset-project": "node ./scripts/reset-project.js",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "web": "expo start --web",
     "lint": "expo lint"
   },
