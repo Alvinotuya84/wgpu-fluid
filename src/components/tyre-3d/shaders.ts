@@ -1,70 +1,139 @@
-// ─── Mesh rendering (Phong lighting) ─────────────────────────────────────────
+// ─── Mesh rendering (PBR — Cook-Torrance GGX) ────────────────────────────────
 //
-// Bind group 0: frame-level (view, proj, lighting) — set once per frame
-// Bind group 1: per-mesh    (model matrix, base colour) — set per draw call
+// Bind group 0: frame-level  (view, proj, lighting)         — set once per frame
+// Bind group 1: per-mesh     (model matrix)                 — set per draw call
+// Bind group 2: per-material (sampler + baseColor + normal + ORM textures)
 
 export const MESH_SHADER = /* wgsl */ `
 
 struct FrameUniforms {
-  view:      mat4x4<f32>,  // offset   0
-  proj:      mat4x4<f32>,  // offset  64
-  lightDir:  vec4<f32>,    // offset 128 (xyz = normalised light direction)
-  cameraPos: vec4<f32>,    // offset 144 (xyz = world-space camera position)
-  isBraking: u32,          // offset 160
-  time:      f32,          // offset 164
+  view:      mat4x4<f32>,
+  proj:      mat4x4<f32>,
+  lightDir:  vec4<f32>,
+  cameraPos: vec4<f32>,
+  isBraking: u32,
+  time:      f32,
   _p0:       f32,
   _p1:       f32,
 };
 
 struct MeshUniforms {
-  model:     mat4x4<f32>,  // offset  0
-  baseColor: vec4<f32>,    // offset 64
+  model: mat4x4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> frame : FrameUniforms;
 @group(1) @binding(0) var<uniform> mesh  : MeshUniforms;
 
+@group(2) @binding(0) var samp         : sampler;
+@group(2) @binding(1) var baseColorTex : texture_2d<f32>;
+@group(2) @binding(2) var normalMapTex : texture_2d<f32>;
+@group(2) @binding(3) var ormTex       : texture_2d<f32>;  // R=occlusion G=roughness B=metallic
+
 struct VertIn {
   @location(0) position : vec3<f32>,
   @location(1) normal   : vec3<f32>,
+  @location(2) uv       : vec2<f32>,
 };
 
 struct VertOut {
-  @builtin(position) clip : vec4<f32>,
-  @location(0)       norm : vec3<f32>,
-  @location(1)       wpos : vec3<f32>,
+  @builtin(position) clip  : vec4<f32>,
+  @location(0)       wnorm : vec3<f32>,
+  @location(1)       wpos  : vec3<f32>,
+  @location(2)       uv    : vec2<f32>,
 };
 
 @vertex
 fn vs(in: VertIn) -> VertOut {
-  let m       = mesh.model;
-  let wpos4   = m * vec4<f32>(in.position, 1.0);
+  let m     = mesh.model;
+  let wpos4 = m * vec4<f32>(in.position, 1.0);
+  let m3    = mat3x3<f32>(m[0].xyz, m[1].xyz, m[2].xyz);
 
-  // Extract rotation (upper-left 3×3) for normal transform.
-  // Valid for rotation-only model matrices (no non-uniform scale).
-  let m3   = mat3x3<f32>(m[0].xyz, m[1].xyz, m[2].xyz);
-  let wnorm = normalize(m3 * in.normal);
-
-  var out : VertOut;
+  var out: VertOut;
   out.clip  = frame.proj * frame.view * wpos4;
-  out.norm  = wnorm;
+  out.wnorm = normalize(m3 * in.normal);
   out.wpos  = wpos4.xyz;
+  out.uv    = in.uv;
   return out;
+}
+
+const PI: f32 = 3.14159265359;
+
+fn D_GGX(NdotH: f32, a2: f32) -> f32 {
+  let d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+  return a2 / (PI * d * d);
+}
+
+fn G_Schlick(NdotX: f32, roughness: f32) -> f32 {
+  let r = roughness + 1.0;
+  let k = r * r / 8.0;
+  return NdotX / (NdotX * (1.0 - k) + k);
+}
+
+fn F_Schlick(cosTheta: f32, F0: vec3<f32>) -> vec3<f32> {
+  return F0 + (vec3<f32>(1.0) - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
 }
 
 @fragment
 fn fs(in: VertOut) -> @location(0) vec4<f32> {
-  let L   = normalize(frame.lightDir.xyz);
-  let V   = normalize(frame.cameraPos.xyz - in.wpos);
-  let H   = normalize(L + V);
-  let N   = normalize(in.norm);
+  // ── Sample textures ───────────────────────────────────────────────────────
+  let baseRaw = textureSample(baseColorTex, samp, in.uv).rgb;
+  let orm     = textureSample(ormTex,       samp, in.uv);
+  let normTS  = textureSample(normalMapTex,  samp, in.uv).xyz * 2.0 - 1.0;
 
-  let ambient  = 0.22;
-  let diffuse  = max(dot(N, L), 0.0) * 0.65;
-  let specular = pow(max(dot(N, H), 0.0), 48.0) * 0.30;
+  // sRGB → linear for base color
+  let albedo    = pow(baseRaw, vec3<f32>(2.2));
+  let ao        = orm.r;
+  let roughness = max(orm.g, 0.05);
+  let metallic  = orm.b;
 
-  let col = mesh.baseColor.rgb * (ambient + diffuse) + vec3<f32>(specular);
-  return vec4<f32>(col, 1.0);
+  // ── TBN from screen-space derivatives (no tangent attribute needed) ───────
+  let dposdx = dpdx(in.wpos);
+  let dposdy = dpdy(in.wpos);
+  let duvdx  = dpdx(in.uv);
+  let duvdy  = dpdy(in.uv);
+
+  let Ng  = normalize(in.wnorm);
+  let det = duvdx.x * duvdy.y - duvdy.x * duvdx.y;
+  // Clamp determinant to avoid divide-by-zero on degenerate UV islands
+  let detS = select(det, 0.0001, abs(det) < 0.0001);
+  let Traw = (duvdy.y * dposdx - duvdx.y * dposdy) / detS;
+  let T    = normalize(Traw - dot(Traw, Ng) * Ng);  // Gram-Schmidt
+  let B    = cross(Ng, T);
+  let N    = normalize(mat3x3<f32>(T, B, Ng) * normTS);
+
+  // ── PBR vectors ───────────────────────────────────────────────────────────
+  let L = normalize(frame.lightDir.xyz);
+  let V = normalize(frame.cameraPos.xyz - in.wpos);
+  let H = normalize(L + V);
+
+  let NdotL = max(dot(N, L), 0.0);
+  let NdotV = max(dot(N, V), 0.001);
+  let NdotH = max(dot(N, H), 0.0);
+  let HdotV = max(dot(H, V), 0.0);
+
+  let F0 = mix(vec3<f32>(0.04), albedo, metallic);
+  let a2 = roughness * roughness * roughness * roughness;  // a = α², a2 = α⁴
+
+  let D = D_GGX(NdotH, a2);
+  let G = G_Schlick(NdotV, roughness) * G_Schlick(NdotL, roughness);
+  let F = F_Schlick(HdotV, F0);
+
+  let kD      = (vec3<f32>(1.0) - F) * (1.0 - metallic);
+  let diffuse  = kD * albedo / PI;
+  let specular = D * G * F / max(4.0 * NdotV * NdotL, 0.0001);
+
+  let radiance = vec3<f32>(4.5);
+  let Lo       = (diffuse + specular) * radiance * NdotL;
+
+  // ── Ambient + occlusion ───────────────────────────────────────────────────
+  let ambient = vec3<f32>(0.06) * albedo * ao;
+  var color   = ambient + Lo;
+
+  // ── HDR tone map (Reinhard) + gamma encode ────────────────────────────────
+  color = color / (color + vec3<f32>(1.0));
+  color = pow(color, vec3<f32>(1.0 / 2.2));
+
+  return vec4<f32>(color, 1.0);
 }
 `;
 

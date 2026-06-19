@@ -1,14 +1,28 @@
 import { Asset } from 'expo-asset';
 
 export interface MeshData {
-  name:      string;
-  positions: Float32Array;
-  normals:   Float32Array;
-  indices:   Uint16Array | Uint32Array;
+  name:        string;
+  positions:   Float32Array;
+  normals:     Float32Array;
+  uvs:         Float32Array;
+  indices:     Uint16Array | Uint32Array;
   indexFormat: 'uint16' | 'uint32';
 }
 
-// ── Minimal GLTF types for the accessor subset we need ────────────────────────
+export interface RawTextures {
+  tireBaseColor:          Uint8Array; // bufferView 4
+  tireNormal:             Uint8Array; // bufferView 5
+  wheelBaseColor:         Uint8Array; // bufferView 6
+  wheelMetallicRoughness: Uint8Array; // bufferView 7
+  wheelNormal:            Uint8Array; // bufferView 8
+}
+
+export interface LoadResult {
+  meshes:   MeshData[];
+  textures: RawTextures;
+}
+
+// ── Minimal GLTF types ────────────────────────────────────────────────────────
 
 interface GLTFAccessor {
   bufferView:    number;
@@ -26,7 +40,7 @@ interface GLTFBufferView {
 }
 
 interface GLTFPrimitive {
-  attributes: { POSITION: number; NORMAL?: number };
+  attributes: { POSITION: number; NORMAL?: number; TEXCOORD_0?: number };
   indices:    number;
   mode?:      number;
 }
@@ -65,28 +79,26 @@ function compBytes(componentType: number): number {
 
 // ── GLB binary parser ─────────────────────────────────────────────────────────
 
-function parseGLB(arrayBuffer: ArrayBuffer): MeshData[] {
+function parseGLB(arrayBuffer: ArrayBuffer): LoadResult {
   const dv = new DataView(arrayBuffer);
 
   const magic = dv.getUint32(0, true);
   if (magic !== 0x46546c67) throw new Error('Not a valid GLB file (wrong magic).');
 
-  // JSON chunk
   const jsonLen  = dv.getUint32(12, true);
-  const jsonType = dv.getUint32(16, true); // 0x4E4F534A = 'JSON'
+  const jsonType = dv.getUint32(16, true);
   if (jsonType !== 0x4e4f534a) throw new Error('Expected JSON chunk first.');
 
   const jsonText = new TextDecoder().decode(new Uint8Array(arrayBuffer, 20, jsonLen));
   const json: GLTFJson = JSON.parse(jsonText);
 
-  // Binary chunk (starts after 12-byte header + JSON chunk header + JSON data)
   const binOffset = 20 + jsonLen;
   const binLen    = dv.getUint32(binOffset, true);
-  const binType   = dv.getUint32(binOffset + 4, true); // 0x004E4942 = 'BIN\0'
+  const binType   = dv.getUint32(binOffset + 4, true);
   if (binType !== 0x004e4942) throw new Error('Expected BIN chunk after JSON.');
 
-  const binStart   = binOffset + 8;
-  const binBuffer  = arrayBuffer.slice(binStart, binStart + binLen);
+  const binStart  = binOffset + 8;
+  const binBuffer = arrayBuffer.slice(binStart, binStart + binLen);
 
   // ── Accessor resolver ───────────────────────────────────────────────────────
   function getFloat32(accessorIdx: number): Float32Array {
@@ -94,20 +106,18 @@ function parseGLB(arrayBuffer: ArrayBuffer): MeshData[] {
     const bv   = json.bufferViews[acc.bufferView];
     const cc   = compCount(acc.type);
     const cb   = compBytes(acc.componentType);
-    const stride   = bv.byteStride ?? (cc * cb);
-    const bvOff    = bv.byteOffset ?? 0;
-    const accOff   = acc.byteOffset ?? 0;
+    const stride    = bv.byteStride ?? (cc * cb);
+    const bvOff     = bv.byteOffset ?? 0;
+    const accOff    = acc.byteOffset ?? 0;
     const startByte = bvOff + accOff;
 
     if (stride === cc * cb) {
-      // Packed — slice and wrap directly
       const byteLen = acc.count * cc * cb;
       return new Float32Array(binBuffer.slice(startByte, startByte + byteLen));
     }
 
-    // Interleaved — de-interleave
-    const out    = new Float32Array(acc.count * cc);
-    const srcDV  = new DataView(binBuffer);
+    const out   = new Float32Array(acc.count * cc);
+    const srcDV = new DataView(binBuffer);
     for (let i = 0; i < acc.count; i++) {
       const base = startByte + i * stride;
       for (let c = 0; c < cc; c++) {
@@ -118,19 +128,25 @@ function parseGLB(arrayBuffer: ArrayBuffer): MeshData[] {
   }
 
   function getIndexBuffer(accessorIdx: number): { data: Uint16Array | Uint32Array; format: 'uint16' | 'uint32' } {
-    const acc  = json.accessors[accessorIdx];
-    const bv   = json.bufferViews[acc.bufferView];
+    const acc    = json.accessors[accessorIdx];
+    const bv     = json.bufferViews[acc.bufferView];
     const bvOff  = bv.byteOffset ?? 0;
     const accOff = acc.byteOffset ?? 0;
     const start  = bvOff + accOff;
     const cb     = compBytes(acc.componentType);
     const bytes  = acc.count * cb;
     const slice  = binBuffer.slice(start, start + bytes);
-
     if (acc.componentType === 5123) {
       return { data: new Uint16Array(slice), format: 'uint16' };
     }
     return { data: new Uint32Array(slice), format: 'uint32' };
+  }
+
+  // Extracts raw bytes from a bufferView (for embedded PNG textures)
+  function extractBV(bvIdx: number): Uint8Array {
+    const bv     = json.bufferViews[bvIdx];
+    const offset = bv.byteOffset ?? 0;
+    return new Uint8Array(binBuffer, offset, bv.byteLength).slice();
   }
 
   // ── Generate flat normals fallback ──────────────────────────────────────────
@@ -158,7 +174,7 @@ function parseGLB(arrayBuffer: ArrayBuffer): MeshData[] {
   }
 
   // ── Extract each mesh ───────────────────────────────────────────────────────
-  const results: MeshData[] = [];
+  const meshes: MeshData[] = [];
 
   for (const mesh of json.meshes ?? []) {
     for (const prim of mesh.primitives ?? []) {
@@ -167,17 +183,29 @@ function parseGLB(arrayBuffer: ArrayBuffer): MeshData[] {
       const normals = prim.attributes.NORMAL !== undefined
         ? getFloat32(prim.attributes.NORMAL)
         : flatNormals(positions, indices);
+      const uvs = prim.attributes.TEXCOORD_0 !== undefined
+        ? getFloat32(prim.attributes.TEXCOORD_0)
+        : new Float32Array(positions.length / 3 * 2); // zero UVs fallback
 
-      results.push({ name: mesh.name ?? 'mesh', positions, normals, indices, indexFormat });
+      meshes.push({ name: mesh.name ?? 'mesh', positions, normals, uvs, indices, indexFormat });
     }
   }
 
-  return results;
+  // ── Extract embedded PNG textures from known bufferViews ───────────────────
+  const textures: RawTextures = {
+    tireBaseColor:          extractBV(4),
+    tireNormal:             extractBV(5),
+    wheelBaseColor:         extractBV(6),
+    wheelMetallicRoughness: extractBV(7),
+    wheelNormal:            extractBV(8),
+  };
+
+  return { meshes, textures };
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
-export async function loadWheelGLB(): Promise<MeshData[]> {
+export async function loadWheelGLB(): Promise<LoadResult> {
   const asset = Asset.fromModule(
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     require('../../../assets/models/car_wheel_with_brake_disc_low_poly.glb'),
