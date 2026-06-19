@@ -1,7 +1,7 @@
 import { Platform, StyleSheet, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
-import { FluidCanvas } from "@/components/fluid-canvas";
+import { Tyre3DCanvas } from "@/components/tyre-3d";
 import { BottomTabInset, MaxContentWidth, Spacing } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
 
@@ -28,7 +28,9 @@ export default function TabTwoScreen() {
 
   return (
     <View style={[styles.scrollView, { backgroundColor: theme.background }]}>
-      <FluidCanvas />
+      <Tyre3DCanvas />
+      {/* <TyreCanvas /> */}
+      {/* <FluidCanvas /> */}
       {/* <NBodyCanvas /> */}
     </View>
   );
