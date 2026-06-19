@@ -1,11 +1,14 @@
 import { mat4 } from 'wgpu-matrix';
 import React, { useCallback, useRef } from 'react';
 import {
-  PixelRatio,
+  Pressable,
   StyleSheet,
+  Text,
   View,
+  PixelRatio,
   type GestureResponderEvent,
 } from 'react-native';
+import { SymbolView } from 'expo-symbols';
 import { Canvas, useCanvasRef, useDevice } from 'react-native-webgpu';
 
 import { loadWheelGLB, type MeshData } from './loader';
@@ -27,7 +30,7 @@ const MESH_COLORS: Record<string, [number, number, number]> = {
   'brake-caliper':[0.82, 0.12, 0.09],
 };
 
-const SPINNING_MESHES = new Set(['tire-low', 'wheel-full', 'brake-disc']);
+const STATIC_MESHES = new Set(['brake-caliper']);
 
 // Normalised light direction (1, 2, 1)
 const LIGHT_DIR = [1 / Math.sqrt(6), 2 / Math.sqrt(6), 1 / Math.sqrt(6)];
@@ -172,6 +175,9 @@ function writeSmokeParams(
 export function Tyre3DCanvas() {
   // Physics state (CPU side)
   const physicsRef = useRef({ angularVelocity: 3.0, angularAngle: 0.0 });
+
+  // Button press state — read each frame inside the render loop
+  const buttonsRef = useRef({ spin: false, brake: false });
 
   // Touch + orbit state
   const touchRef = useRef({
@@ -402,15 +408,25 @@ export function Tyre3DCanvas() {
       const orbit   = orbitRef.current;
 
       // ── Physics update (CPU) ──────────────────────────────────────────────
-      const isBraking = touch.active && !touch.isDragging;
+      const buttons   = buttonsRef.current;
+      const touchBrake = touch.active && !touch.isDragging;
+      const isBraking  = touchBrake || buttons.brake;
 
-      if (isBraking) {
+      if (buttons.spin && !isBraking) {
+        // Accelerator: spin up beyond normal cruise speed
+        physics.angularVelocity = Math.min(
+          physics.angularVelocity * 1.015,
+          MAX_ANGULAR_VELOCITY * 1.5,
+        );
+        touch.holdDuration = 0;
+      } else if (isBraking) {
         touch.holdDuration += DT;
         const aggressive = touch.holdDuration > AGGRESSIVE_THRESHOLD;
         physics.angularVelocity *= aggressive ? 0.80 : 0.94;
         physics.angularVelocity  = Math.max(physics.angularVelocity, 0);
       } else {
         physics.angularVelocity = Math.min(physics.angularVelocity * 1.003, MAX_ANGULAR_VELOCITY);
+        touch.holdDuration = 0; // render loop owns this reset
       }
       physics.angularAngle += physics.angularVelocity * DT;
 
@@ -437,7 +453,7 @@ export function Tyre3DCanvas() {
 
       // ── Write per-mesh uniforms ───────────────────────────────────────────
       for (const gm of gpuMeshes) {
-        const model = SPINNING_MESHES.has(gm.name) ? modelSpinning : modelIdentity;
+        const model = STATIC_MESHES.has(gm.name) ? modelIdentity : modelSpinning;
         writeMeshUniforms(gm.uniformBuf, device.queue, model, gm.color);
       }
 
@@ -531,22 +547,57 @@ export function Tyre3DCanvas() {
   };
 
   const handleTouchEnd = () => {
-    touchRef.current.active       = false;
-    touchRef.current.isDragging   = false;
-    touchRef.current.holdDuration = 0;
+    touchRef.current.active     = false;
+    touchRef.current.isDragging = false;
+    // holdDuration reset is owned by the render loop (else branch)
   };
 
   return (
-    <View
-      style={styles.container}
-      onStartShouldSetResponder={() => true}
-      onMoveShouldSetResponder={() => true}
-      onResponderGrant={handleTouchStart}
-      onResponderMove={handleTouchMove}
-      onResponderRelease={handleTouchEnd}
-      onResponderTerminate={handleTouchEnd}
-    >
-      <Canvas ref={canvasRef} style={styles.canvas} />
+    <View style={styles.container}>
+      {/* Canvas + orbit gesture layer — fills container, behind buttons in z-order */}
+      <View
+        style={StyleSheet.absoluteFill}
+        onStartShouldSetResponder={() => true}
+        onMoveShouldSetResponder={() => true}
+        onResponderGrant={handleTouchStart}
+        onResponderMove={handleTouchMove}
+        onResponderRelease={handleTouchEnd}
+        onResponderTerminate={handleTouchEnd}
+      >
+        <Canvas ref={canvasRef} style={styles.canvas} />
+      </View>
+
+      {/* Button bar — sibling of gesture layer, not a child, so onMoveShouldSetResponder
+          on the gesture view never fires for touches on these Pressables */}
+      <View style={styles.buttonBar}>
+        <Pressable
+          style={({ pressed }) => [styles.btn, styles.btnAccel, pressed && styles.btnPressed]}
+          onPressIn={() => { buttonsRef.current.spin = true; }}
+          onPressOut={() => { buttonsRef.current.spin = false; }}
+        >
+          <SymbolView
+            name="bolt.fill"
+            style={styles.btnIcon}
+            tintColor="#ffffff"
+            resizeMode="scaleAspectFit"
+          />
+          <Text style={styles.btnLabel}>Gas</Text>
+        </Pressable>
+
+        <Pressable
+          style={({ pressed }) => [styles.btn, styles.btnBrake, pressed && styles.btnPressed]}
+          onPressIn={() => { buttonsRef.current.brake = true; }}
+          onPressOut={() => { buttonsRef.current.brake = false; }}
+        >
+          <SymbolView
+            name="stop.fill"
+            style={styles.btnIcon}
+            tintColor="#ffffff"
+            resizeMode="scaleAspectFit"
+          />
+          <Text style={styles.btnLabel}>Brake</Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
@@ -554,4 +605,59 @@ export function Tyre3DCanvas() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0f0f17' },
   canvas:    { flex: 1 },
+
+  // Button bar — absolute, centred at bottom, transparent to touches outside buttons
+  buttonBar: {
+    position:       'absolute',
+    bottom:         44,
+    left:           0,
+    right:          0,
+    flexDirection:  'row',
+    justifyContent: 'center',
+    alignItems:     'center',
+    gap:            32,
+  },
+
+  btn: {
+    width:           80,
+    height:          80,
+    borderRadius:    40,
+    alignItems:      'center',
+    justifyContent:  'center',
+    gap:             4,
+    borderWidth:     2,
+    // semi-transparent dark fill so the tyre shows through
+    backgroundColor: 'rgba(12, 12, 20, 0.72)',
+  },
+  btnAccel: {
+    borderColor: '#22C55E', // green
+    shadowColor: '#22C55E',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.6,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  btnBrake: {
+    borderColor: '#EF4444', // red
+    shadowColor: '#EF4444',
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.6,
+    shadowRadius: 8,
+    elevation: 8,
+  },
+  btnPressed: {
+    opacity: 0.65,
+    transform: [{ scale: 0.93 }],
+  },
+  btnIcon: {
+    width:  32,
+    height: 32,
+  },
+  btnLabel: {
+    fontSize:   10,
+    fontWeight: '600',
+    color:      'rgba(255,255,255,0.75)',
+    letterSpacing: 0.5,
+    textTransform: 'uppercase',
+  },
 });
